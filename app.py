@@ -1,0 +1,266 @@
+# app.py
+# PNG Raster Detail QA service (Flask) — accepts a PNG upload and returns QA metrics
+
+from flask import Flask, request, jsonify
+import base64, zlib, struct, math
+
+app = Flask(__name__)
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+def num(v, fb=None):
+    try:
+        n = float(v)
+        if math.isfinite(n): return n
+    except Exception:
+        pass
+    return fb
+
+def otsu_threshold(gray):
+    hist = [0]*256
+    for g in gray: hist[g]+=1
+    total = len(gray)
+    s_all = sum(i*hist[i] for i in range(256))
+    sB=wB=0; best=-1.0; thr=128
+    for t in range(256):
+        wB+=hist[t]
+        if wB==0: continue
+        wF=total-wB
+        if wF==0: break
+        sB+=t*hist[t]
+        mB=sB/float(wB)
+        mF=(s_all-sB)/float(wF)
+        between=float(wB)*float(wF)*(mB-mF)*(mB-mF)
+        if between>best:
+            best=between; thr=t
+    return thr
+
+def percentile(arr, p):
+    if not arr: return None
+    arr2=sorted(arr)
+    idx=max(0, int(round((len(arr2)-1)*p)))
+    return arr2[idx]
+
+def decode_png_to_gray(png_bytes):
+    if png_bytes[:8]!=PNG_MAGIC: raise ValueError("not a PNG")
+
+    def u32(b,o): return struct.unpack(">I", b[o:o+4])[0]
+
+    off=8; width=height=bit_depth=color_type=None; idat=[]
+    L=len(png_bytes)
+    while off+8<=L:
+        length=u32(png_bytes, off); off+=4
+        ctype=png_bytes[off:off+4]; off+=4
+        data=png_bytes[off:off+length]; off+=length
+        off+=4 # CRC
+        if ctype==b'IHDR':
+            width=u32(data,0); height=u32(data,4)
+            bit_depth=data[8]; color_type=data[9]
+        elif ctype==b'IDAT':
+            idat.append(data)
+        elif ctype==b'IEND':
+            break
+
+    if bit_depth!=8 or color_type not in (0,2,6):
+        raise ValueError(f"Unsupported PNG (bitDepth={bit_depth}, colorType={color_type})")
+
+    raw=zlib.decompress(b"".join(idat))
+    bpp=4 if color_type==6 else (3 if color_type==2 else 1)
+    stride=width*bpp
+    recon=bytearray(width*height*bpp)
+    pos=0; prev=bytes([0])*stride
+
+    def paeth(a,b,c):
+        p=a+b-c
+        pa=abs(p-a); pb=abs(p-b); pc=abs(p-c)
+        if pa<=pb and pa<=pc: return a
+        return b if pb<=pc else c
+
+    dst=0
+    for _y in range(height):
+        f=raw[pos]; pos+=1
+        for x in range(stride):
+            rv=raw[pos]; pos+=1
+            left=recon[dst+x-bpp] if x>=bpp else 0
+            up=prev[x] if x<len(prev) else 0
+            ul=prev[x-bpp] if x>=bpp else 0
+            if f==0: val=rv
+            elif f==1: val=(rv+left)&255
+            elif f==2: val=(rv+up)&255
+            elif f==3: val=(rv+((left+up)//2))&255
+            elif f==4: val=(rv+paeth(left,up,ul))&255
+            else: val=rv
+            recon[dst+x]=val
+        prev=recon[dst:dst+stride]; dst+=stride
+
+    gray=[0]*(width*height); i=0
+    if color_type==6:
+        for y in range(height):
+            for x in range(width):
+                r,g,b,a=recon[i],recon[i+1],recon[i+2],recon[i+3]; i+=4
+                lum=int(0.2126*r+0.7152*g+0.0722*b)
+                lum=int((a/255.0)*lum+(1.0-a/255.0)*255.0)
+                gray[y*width+x]=lum
+    elif color_type==2:
+        for y in range(height):
+            for x in range(width):
+                r,g,b=recon[i],recon[i+1],recon[i+2]; i+=3
+                gray[y*width+x]=int(0.2126*r+0.7152*g+0.0722*b)
+    else:
+        for y in range(height):
+            for x in range(width):
+                gray[y*width+x]=recon[i]; i+=1
+    return width, height, gray
+
+def measure_all(ink, w, h):
+    minX,minY,maxX,maxY=w,h,-1,-1; ink_count=0
+    for y in range(h):
+        base=y*w
+        for x in range(w):
+            if ink[base+x]:
+                ink_count+=1
+                if x<minX:minX=x
+                if x>maxX:maxX=x
+                if y<minY:minY=y
+                if y>maxY:maxY=y
+    if ink_count==0: return None
+
+    min_line=float("inf"); min_gap=float("inf")
+    for y in range(minY, maxY+1):
+        run=gap=0; base=y*w
+        for x in range(minX, maxX+1):
+            v=ink[base+x]
+            if v:
+                if gap>0: min_gap=min(min_gap,gap); gap=0
+                run+=1
+            else:
+                if run>0: min_line=min(min_line,run); run=0
+                gap+=1
+        if run>0: min_line=min(min_line,run)
+        if gap>0: min_gap=min(min_gap,gap)
+    for x in range(minX, maxX+1):
+        run=gap=0
+        for y in range(minY, maxY+1):
+            v=ink[y*w+x]
+            if v:
+                if gap>0: min_gap=min(min_gap,gap); gap=0
+                run+=1
+            else:
+                if run>0: min_line=min(min_line,run); run=0
+                gap+=1
+        if run>0: min_line=min(min_line,run)
+        if gap>0: min_gap=min(min_gap,gap)
+    if not math.isfinite(min_line): min_line=0
+    if not math.isfinite(min_gap):  min_gap=0
+    # very cheap text-height proxy
+    heights=[]
+    lab=[0]*(w*h); stack=[]; label=0
+    for y in range(minY, maxY+1):
+        for x in range(minX, maxX+1):
+            idx=y*w+x
+            if ink[idx]==0 or lab[idx]!=0: continue
+            label+=1; miny=y; maxy=y
+            stack.append((x,y)); lab[idx]=label
+            while stack:
+                cx,cy=stack.pop(); cidx=cy*w+cx
+                if cy<miny:miny=cy
+                if cy>maxy:maxy=cy
+                if cx>minX:
+                    n=cidx-1
+                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx-1,cy))
+                if cx<maxX:
+                    n=cidx+1
+                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx+1,cy))
+                if cy>minY:
+                    n=cidx-w
+                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy-1))
+                if cy<maxY:
+                    n=cidx+w
+                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy+1))
+            hgt=maxy-miny+1
+            if hgt>=1: heights.append(hgt)
+    min_text_px=percentile(heights, 0.10) if heights else None
+    return min_line, min_gap, min_text_px
+
+@app.route("/png-qa", methods=["POST"])
+def png_qa():
+    """
+    Accepts:
+      - multipart/form-data with file field "file" (recommended), or
+      - JSON: {"cutout_b64": "<base64>"}  (fallback)
+      - Optional JSON params: min_text_height_in, min_negative_space_in, min_line_weight_in, print_width_in, print_height_in
+    """
+    try:
+        png_bytes=None
+        # multipart
+        f = request.files.get("file")
+        if f: png_bytes = f.read()
+        # json base64 fallback
+        if png_bytes is None and request.is_json:
+            j = request.get_json(silent=True) or {}
+            b64 = j.get("cutout_b64")
+            if isinstance(b64, str):
+                s=b64.strip()
+                if s.startswith("data:"): s=s.split(",",1)[1] if "," in s else ""
+                s="".join(s.split())
+                pad=(-len(s))%4
+                if pad: s+="="*pad
+                try: png_bytes = base64.b64decode(s, validate=False)
+                except Exception: png_bytes=None
+        if png_bytes is None or len(png_bytes)<8 or png_bytes[:8]!=PNG_MAGIC:
+            return jsonify({"ok": False, "error": "no_png"}), 400
+
+        width, height, gray = decode_png_to_gray(png_bytes)
+        thr = otsu_threshold(gray)
+        ink = [1 if g < thr else 0 for g in gray]
+
+        j = {}
+        if request.is_json:
+            j = request.get_json(silent=True) or {}
+
+        if j.get("print_width_in") is not None:
+            px_per_in = width / float(j["print_width_in"])
+        elif j.get("print_height_in") is not None:
+            px_per_in = height / float(j["print_height_in"])
+        else:
+            px_per_in = 300.0
+
+        meas = measure_all(ink, width, height)
+        if meas is None:
+            return jsonify({"ok": True, "design_passed":"No","why":"PNG appears empty after binarization.","failed_parts":["input"],"metrics":{"width_px":width,"height_px":height,"px_per_in":px_per_in}})
+
+        min_line_px, min_gap_px, min_text_px = meas
+        metrics = {
+            "min_text_height_in": (min_text_px/px_per_in) if min_text_px is not None else None,
+            "min_line_weight_in": (min_line_px/px_per_in) if min_line_px > 0 else None,
+            "min_negative_space_in": (min_gap_px/px_per_in) if min_gap_px > 0 else (1.0/72.0),
+            "width_px": width,
+            "height_px": height,
+            "px_per_in": px_per_in
+        }
+
+        TH_TEXT = num(j.get("min_text_height_in"),    0.10)
+        TH_GAP  = num(j.get("min_negative_space_in"), 1.0/72.0)
+        TH_LINE = num(j.get("min_line_weight_in"),    0.005)
+
+        failed=[]; why=[]
+        if metrics["min_text_height_in"] is not None and metrics["min_text_height_in"] < TH_TEXT:
+            failed.append("text");  why.append(f'Smallest text is {metrics["min_text_height_in"]:.3f}" (< {TH_TEXT:.3f}").')
+        if metrics["min_line_weight_in"] is not None and metrics["min_line_weight_in"] < TH_LINE:
+            failed.append("line");  why.append(f'Line min {metrics["min_line_weight_in"]:.3f}" (< {TH_LINE:.3f}").')
+        if metrics["min_negative_space_in"] < TH_GAP:
+            failed.append("negative_space");  why.append(f'Negative space min {metrics["min_negative_space_in"]:.3f}" (< {TH_GAP:.3f}").')
+
+        passed = (len(failed)==0)
+        return jsonify({
+            "ok": True,
+            "design_passed": "Yes" if passed else "No",
+            "why": " ".join(why) if why else "All detail rules met.",
+            "failed_parts": failed,
+            "metrics": metrics
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
