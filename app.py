@@ -1,18 +1,6 @@
 # app.py — PNG Raster Detail QA service (Flask)
-# POST /png-qa
-#   Accepts multipart "file" OR JSON/form with "cutout_b64"
-#   Optional params:
-#     px_per_in, print_width_in, print_height_in,
-#     min_text_height_in, min_negative_space_in, min_line_weight_in,
-#     gap_alias_px, ignore_border_px, use_roi_for_ppi,
-#     use_ocr_for_text, ocr_lang, ocr_min_conf, ocr_psm,
-#     text_min_comp_px, text_percentile
-#
-# Returns JSON: ok, design_passed, why, failed_parts, confidence,
-# metrics {... incl. px_per_in used, debug_min_* positions, roi_interior, text_source, etc.}
-
 from flask import Flask, request, jsonify
-import base64, zlib, struct, math, tempfile, subprocess, os
+import base64, zlib, struct, math, os
 
 app = Flask(__name__)
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -38,8 +26,7 @@ def num(v, fb=None):
 
 def truthy(v):
     if v is None: return False
-    s = str(v).strip().lower()
-    return s in ("1","true","yes","y","on")
+    return str(v).strip().lower() in ("1","true","yes","y","on")
 
 def otsu_threshold(gray):
     hist = [0]*256
@@ -66,6 +53,7 @@ def percentile(arr, p):
     idx = max(0, int(round((len(arr2)-1)*p)))
     return arr2[idx]
 
+# ---------- PNG → grayscale ----------
 def decode_png_to_gray(png_bytes):
     if png_bytes[:8] != PNG_MAGIC:
         raise ValueError("not a PNG")
@@ -93,7 +81,6 @@ def decode_png_to_gray(png_bytes):
     bpp=4 if color_type==6 else (3 if color_type==2 else 1)
     stride=width*bpp
     recon=bytearray(width*height*bpp)
-    pos=0; prev=bytes([0])*stride
 
     def paeth(a,b,c):
         p=a+b-c
@@ -101,7 +88,7 @@ def decode_png_to_gray(png_bytes):
         if pa<=pb and pa<=pc: return a
         return b if pb<=pc else c
 
-    dst=0
+    pos=0; prev=bytes([0])*stride; dst=0
     for _y in range(height):
         f=raw[pos]; pos+=1
         for x in range(stride):
@@ -120,21 +107,21 @@ def decode_png_to_gray(png_bytes):
 
     gray=[0]*(width*height); i=0
     if color_type==6:
-        for y in range(height):
-            for x in range(width):
+        for _y in range(height):
+            for _x in range(width):
                 r,g,b,a=recon[i],recon[i+1],recon[i+2],recon[i+3]; i+=4
                 lum=int(0.2126*r+0.7152*g+0.0722*b)
                 lum=int((a/255.0)*lum+(1.0-a/255.0)*255.0)
-                gray[y*width+x]=lum
+                gray[_y*width+_x]=lum
     elif color_type==2:
-        for y in range(height):
-            for x in range(width):
+        for _y in range(height):
+            for _x in range(width):
                 r,g,b=recon[i],recon[i+1],recon[i+2]; i+=3
-                gray[y*width+x]=int(0.2126*r+0.7152*g+0.0722*b)
+                gray[_y*width+_x]=int(0.2126*r+0.7152*g+0.0722*b)
     else:
-        for y in range(height):
-            for x in range(width):
-                gray[y*width+x]=recon[i]; i+=1
+        for _y in range(height):
+            for _x in range(width):
+                gray[_y*width+_x]=recon[i]; i+=1
     return width, height, gray
 
 # ---------- binary ops ----------
@@ -213,25 +200,21 @@ def closing(ink,w,h,radius_px):
         out=erode1(out,w,h)
     return out
 
-def opening(ink,w,h,radius_px):
-    out=ink[:]
-    for _ in range(max(0,int(radius_px))):
-        out=erode1(out,w,h)
-        out=dilate1(out,w,h)
-    return out
-
-def inset_roi(roi, w, h, inset):
-    if inset<=0: return roi
-    x0,y0,x1,y1 = roi
-    x0 = min(max(0, x0+inset), w-1)
-    y0 = min(max(0, y0+inset), h-1)
-    x1 = max(min(w-1, x1-inset), 0)
-    y1 = max(min(h-1, y1-inset), 0)
-    if x1 < x0 or y1 < y0:
-        return (0,0,-1,-1)
+def clamp_roi(x0,y0,x1,y1,w,h):
+    x0=max(0,min(x0,w-1)); y0=max(0,min(y0,h-1))
+    x1=max(0,min(x1,w-1)); y1=max(0,min(y1,h-1))
+    if x1<x0: x0,x1=x1,x0
+    if y1<y0: y0,y1=y1,y0
     return (x0,y0,x1,y1)
 
-def measure_min_line_and_gap_pos(ink,w,h,roi):
+def inset_roi(roi, inset):
+    x0,y0,x1,y1 = roi
+    xi, yi = x0+inset, y0+inset
+    xa, ya = x1-inset, y1-inset
+    if xa<=xi or ya<=yi: return roi
+    return (xi,yi,xa,ya)
+
+def measure_min_line_and_gap_pos(ink,w,h,roi=None):
     if roi is None:
         minX,minY,maxX,maxY=bbox_of_ink(ink,w,h)
     else:
@@ -242,24 +225,21 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
     min_line=1e9; min_gap=1e9
     pos_line=None; pos_gap=None
 
-    # horizontal sweeps
+    # horizontal
     for y in range(minY,maxY+1):
-        base=y*w
-        run=0; gap=0
+        base=y*w; run=0; gap=0
         for x in range(minX,maxX+1):
             v=ink[base+x]
             if v:
                 if gap>0 and gap<min_gap:
                     min_gap=gap
                     pos_gap={"orient":"H","y":y,"x0":x-gap,"x1":x-1,"len_px":gap}
-                gap=0
-                run+=1
+                gap=0; run+=1
             else:
                 if run>0 and run<min_line:
                     min_line=run
                     pos_line={"orient":"H","y":y,"x0":x-run,"x1":x-1,"len_px":run}
-                run=0
-                gap+=1
+                run=0; gap+=1
         if run>0 and run<min_line:
             min_line=run
             pos_line={"orient":"H","y":y,"x0":maxX+1-run,"x1":maxX,"len_px":run}
@@ -267,7 +247,7 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
             min_gap=gap
             pos_gap={"orient":"H","y":y,"x0":maxX+1-gap,"x1":maxX,"len_px":gap}
 
-    # vertical sweeps
+    # vertical
     for x in range(minX,maxX+1):
         run=0; gap=0
         for y in range(minY,maxY+1):
@@ -276,14 +256,12 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
                 if gap>0 and gap<min_gap:
                     min_gap=gap
                     pos_gap={"orient":"V","x":x,"y0":y-gap,"y1":y-1,"len_px":gap}
-                gap=0
-                run+=1
+                gap=0; run+=1
             else:
                 if run>0 and run<min_line:
                     min_line=run
                     pos_line={"orient":"V","x":x,"y0":y-run,"y1":y-1,"len_px":run}
-                run=0
-                gap+=1
+                run=0; gap+=1
         if run>0 and run<min_line:
             min_line=run
             pos_line={"orient":"V","x":x,"y0":maxY+1-run,"y1":maxY,"len_px":run}
@@ -294,7 +272,7 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
     if not math.isfinite(min_line): min_line=0
     if not math.isfinite(min_gap): min_gap=0
 
-    # center points
+    # centers
     if pos_gap:
         if pos_gap.get("orient")=="H":
             pos_gap["cx"]=(pos_gap["x0"]+pos_gap["x1"])//2
@@ -312,106 +290,43 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
 
     return int(min_line), int(min_gap), pos_line, pos_gap
 
-def estimate_min_text_height_px_filtered(ink,w,h,roi=None,min_comp_px=6,pctl=0.20):
+def estimate_min_text_height_px(ink,w,h,roi=None):
     if roi is None:
-        roi=bbox_of_ink(ink,w,h)
-    x0,y0,x1,y1=roi
-    if x1<x0 or y1<y0: return None
-
+        minX,minY,maxX,maxY=bbox_of_ink(ink,w,h)
+    else:
+        minX,minY,maxX,maxY=roi
+    if maxX<minX or maxY<minY: return None
     lab=[0]*(w*h); heights=[]; stack=[]; label=0
-    for y in range(y0,y1+1):
-        for x in range(x0,x1+1):
+    for y in range(minY,maxY+1):
+        for x in range(minX,maxX+1):
             idx=y*w+x
             if ink[idx]==0 or lab[idx]!=0: continue
-            label+=1
-            minx=maxx=x; miny=maxy=y
+            label+=1; miny=y; maxy=y
             lab[idx]=label; stack.append((x,y))
             while stack:
                 cx,cy=stack.pop(); cidx=cy*w+cx
-                if cx<minx:minx=cx
-                if cx>maxx:maxx=cx
                 if cy<miny:miny=cy
                 if cy>maxy:maxy=cy
-                # 4-connected
-                if cx>x0:
+                if cx>minX:
                     n=cidx-1
                     if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx-1,cy))
-                if cx<x1:
+                if cx<maxX:
                     n=cidx+1
                     if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx+1,cy))
-                if cy>y0:
+                if cy>minY:
                     n=cidx-w
                     if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy-1))
-                if cy<y1:
+                if cy<maxY:
                     n=cidx+w
                     if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy+1))
-            comp_w=maxx-minx+1; comp_h=maxy-miny+1
-            comp_min=min(comp_w, comp_h)
-            comp_area=comp_w*comp_h
-            if comp_min>=min_comp_px and comp_area >= (min_comp_px*min_comp_px):
-                heights.append(comp_h)
-    if not heights: return None
-    return percentile(heights, pctl)
-
-# ---------- OCR (Tesseract CLI) ----------
-def ocr_word_heights_from_png_bytes(png_bytes, roi=None, lang='eng', min_conf=70, psm='6'):
-    """Return list of OCR word heights (px) inside ROI using tesseract TSV."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            f.write(png_bytes)
-            tmp_path = f.name
-
-        cmd = ['tesseract', tmp_path, 'stdout', '--psm', str(psm), '-l', lang, 'tsv']
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-        if res.returncode != 0 or not res.stdout:
-            return []
-
-        lines = res.stdout.splitlines()
-        if not lines:
-            return []
-
-        headers = lines[0].split('\t')
-        idx = {h: i for i, h in enumerate(headers)}
-        needed = {'level','conf','left','top','width','height'}
-        if not needed.issubset(idx):
-            return []
-
-        if roi:
-            x0,y0,x1,y1 = roi
-        else:
-            x0=y0=0; x1=y1=10**9
-
-        heights=[]
-        for line in lines[1:]:
-            parts = line.split('\t')
-            if len(parts) < len(headers): continue
-            try:
-                level = int(parts[idx['level']])
-                if level != 5:  # word level
-                    continue
-                conf = float(parts[idx['conf']])
-                if conf < float(min_conf):
-                    continue
-                L = int(parts[idx['left']]); T = int(parts[idx['top']])
-                W = int(parts[idx['width']]); H = int(parts[idx['height']])
-                if W <= 0 or H <= 0: continue
-                if (L > x1) or (T > y1) or (L+W < x0) or (T+H < y0):
-                    continue
-                heights.append(H)
-            except Exception:
-                continue
-        return heights
-    except Exception:
-        return []
+            hgt=maxy-miny+1
+            if hgt>=1: heights.append(hgt)
+    return percentile(heights,0.10) if heights else None
 
 # ---------- core QA ----------
 def run_png_qa_core(png_bytes, params):
     width, height, gray = decode_png_to_gray(png_bytes)
+
     thr = otsu_threshold(gray)
     ink_raw = [1 if g < thr else 0 for g in gray]
 
@@ -419,9 +334,10 @@ def run_png_qa_core(png_bytes, params):
     ink_no_border = zero_border(ink_raw, width, height, ignore_border)
 
     roi = bbox_of_ink(ink_no_border, width, height)
-    roi_w = max(0, roi[2]-roi[0]+1)
-    roi_h = max(0, roi[3]-roi[1]+1)
+    roi = clamp_roi(*roi, width, height)
+    roi_w = max(0, roi[2]-roi[0]+1); roi_h = max(0, roi[3]-roi[1]+1)
 
+    # ppi
     px_per_in = fnum(params.get("px_per_in"))
     use_roi_ppi = truthy(params.get("use_roi_for_ppi"))
     if not px_per_in:
@@ -435,114 +351,87 @@ def run_png_qa_core(png_bytes, params):
             elif ph and ph>0: px_per_in = height / ph
             else: px_per_in = 300.0
 
-    alias_px = int(max(1, fnum(params.get("gap_alias_px"), 1)))
+    # insets & guards
+    user_inset_px = int(max(0, fnum(params.get("inset_px"), 0)))
+    inset_frac     = fnum(params.get("inset_frac"), 0.02)   # 2% of ROI
+    auto_inset_px  = int(round(min(roi_w, roi_h) * inset_frac)) if roi_w and roi_h else 0
+    ppi_inset_px   = int(round(px_per_in * 0.01))           # 1% of ppi
+    base_inset     = max(user_inset_px, auto_inset_px, ppi_inset_px)
+
+    edge_guard_px  = int(max(0, fnum(params.get("edge_guard_px"), 8)))  # NEW
+    effective_inset = base_inset + edge_guard_px
+
+    roi_interior = inset_roi(roi, effective_inset)
+
+    # cleaning / alias tolerance
+    alias_px = int(max(1, fnum(params.get("gap_alias_px"), 2)))
     ink_clean  = majority3x3(ink_no_border, width, height)
     ink_closed = closing(ink_clean, width, height, alias_px)
 
-    # interior ROI to avoid thin seam at the crop edges
-    safety_inset_px = max(
-        alias_px,
-        ignore_border,
-        int(max(2, round(px_per_in * 0.02)))  # ~2% of an inch
-    )
-    roi_interior = inset_roi(roi, width, height, safety_inset_px)
+    # measure inside guarded interior
+    min_line_px_raw, _mg_unused, pos_line_raw, _pg_unused = \
+        measure_min_line_and_gap_pos(ink_no_border, width, height, roi_interior)
+    _ml_closed, min_gap_px_closed, _pl_unused, pos_gap_closed = \
+        measure_min_line_and_gap_pos(ink_closed, width, height, roi_interior)
+    min_text_px = estimate_min_text_height_px(ink_no_border, width, height, roi_interior)
 
-    # ---- line & gap inside interior ROI
-    min_line_px_raw, _mg_unused, pos_line_raw, _pg_unused = measure_min_line_and_gap_pos(
-        ink_clean, width, height, roi_interior
-    )
-    _ml_closed, min_gap_px_closed, _pl_unused, pos_gap_closed = measure_min_line_and_gap_pos(
-        ink_closed, width, height, roi_interior
-    )
+    # enforce minimum meaningful span for gaps (size-aware)
+    default_min_span_px = int(max(6, round(px_per_in * 0.01), alias_px*4))
+    min_gap_span_px     = int(max(3, fnum(params.get("min_gap_span_px"), default_min_span_px)))
+    if pos_gap_closed and pos_gap_closed.get("len_px", 1_000_000) < min_gap_span_px:
+        min_gap_px_closed = max(min_gap_px_closed, min_gap_span_px)
 
-    # ----- TEXT HEIGHT: prefer OCR, then fallback to morphology
-    min_text_px = None
-    text_source = "morph"
-
-    if truthy(params.get("use_ocr_for_text")):
-        ocr_lang = params.get("ocr_lang", "eng")
-        ocr_conf = int(max(0, fnum(params.get("ocr_min_conf"), 70)))
-        ocr_psm  = str(params.get("ocr_psm", "6"))
-        word_heights = ocr_word_heights_from_png_bytes(
-            png_bytes, roi=roi_interior, lang=ocr_lang, min_conf=ocr_conf, psm=ocr_psm
-        )
-        if word_heights:
-            min_keep = max(6, int(round(px_per_in * 0.04)))         # ~4% inch
-            max_keep = int(round(px_per_in * 1.25))                 # cap giant boxes
-            clean = [h for h in word_heights if min_keep <= h <= max_keep]
-            if clean:
-                text_pctl = fnum(params.get("text_percentile"), 0.20)
-                text_pctl = min(max(text_pctl, 0.05), 0.5)
-                min_text_px = percentile(clean, text_pctl)
-                text_source = "ocr"
-
-    if min_text_px is None:
-        text_open_r = max(alias_px, int(round(px_per_in * 0.02)))   # ~2% inch
-        ink_for_text = opening(ink_closed, width, height, text_open_r)
-
-        user_min_comp = int(max(0, fnum(params.get("text_min_comp_px"), 0) or 0))
-        min_comp_px = max(user_min_comp, 6, int(round(px_per_in * 0.04)))  # ~4% inch
-
-        text_pctl = fnum(params.get("text_percentile"), 0.20)      # 20th percentile
-        text_pctl = min(max(text_pctl, 0.05), 0.5)
-
-        min_text_px = estimate_min_text_height_px_filtered(
-            ink_for_text, width, height, roi_interior, min_comp_px=min_comp_px, pctl=text_pctl
-        )
-        text_source = "morph"
-
-    # robust minima
-    min_line_px = max(min_line_px_raw, alias_px)
+    min_line_px = min_line_px_raw
     min_gap_px  = max(min_gap_px_closed, alias_px)
 
-    # thresholds
-    TH_TEXT = num(params.get("min_text_height_in"),    0.10)       # 0.10 in
-    TH_GAP  = num(params.get("min_negative_space_in"), 1.0/72.0)   # 1 pt
-    TH_LINE = num(params.get("min_line_weight_in"),    0.005)      # 0.005 in
+    # thresholds (inches)
+    TH_TEXT = num(params.get("min_text_height_in"),    0.10)
+    TH_GAP  = num(params.get("min_negative_space_in"), 1.0/72.0)
+    TH_LINE = num(params.get("min_line_weight_in"),    0.005)
 
-    # metrics (in inches)
     metrics = {
-        "width_px": width,
-        "height_px": height,
+        "width_px": width, "height_px": height,
         "roi": {"x0": roi[0], "y0": roi[1], "x1": roi[2], "y1": roi[3], "w": roi_w, "h": roi_h},
-        "roi_interior": {"x0": roi_interior[0], "y0": roi_interior[1],
-                         "x1": roi_interior[2], "y1": roi_interior[3],
-                         "w": max(0, roi_interior[2]-roi_interior[0]+1),
-                         "h": max(0, roi_interior[3]-roi_interior[1]+1)},
-        "inset_px": safety_inset_px,
-        "px_per_in": px_per_in,
-        "used_px_per_in": px_per_in,
-        "min_line_weight_in":   (min_line_px/px_per_in) if min_line_px>0 else None,
-        "min_negative_space_in":(min_gap_px /px_per_in) if min_gap_px >0 else (1.0/72.0),
-        "min_text_height_in":   (min_text_px/px_per_in) if (min_text_px is not None) else None,
+        "roi_interior": {
+            "x0": roi_interior[0], "y0": roi_interior[1],
+            "x1": roi_interior[2], "y1": roi_interior[3],
+            "w": max(0, roi_interior[2]-roi_interior[0]+1),
+            "h": max(0, roi_interior[3]-roi_interior[1]+1),
+        },
+        "px_per_in": px_per_in, "used_px_per_in": px_per_in,
+        "min_line_weight_in":    (min_line_px / px_per_in) if min_line_px > 0 else None,
+        "min_negative_space_in": (min_gap_px  / px_per_in) if min_gap_px  > 0 else (1.0/72.0),
+        "min_text_height_in":    (min_text_px / px_per_in) if (min_text_px is not None) else None,
         "alias_px": alias_px,
+        "text_min_comp_px": default_min_span_px,
         "gap_threshold_px": TH_GAP * px_per_in,
         "debug_min_gap":  pos_gap_closed,
         "debug_min_line": pos_line_raw,
         "ignore_border_px": ignore_border,
-        "use_roi_for_ppi": use_roi_ppi,
-        "text_source": text_source
+        "effective_inset_px": effective_inset,
+        "edge_guard_px": edge_guard_px,
+        "use_roi_for_ppi": use_roi_ppi
     }
 
-    # pass/fail + margins
-    failed=[]; why=[]; margins={}
+    failed=[]; why=[]
+    margins = {}
+
     if metrics["min_text_height_in"] is not None:
         margins["text_in"] = metrics["min_text_height_in"] - TH_TEXT
         if metrics["min_text_height_in"] < TH_TEXT:
             failed.append("text")
-            why.append('Smallest text is %.3f" (< %.3f").' %
-                       (metrics["min_text_height_in"], TH_TEXT))
+            why.append('Smallest text is %.3f" (< %.3f").' % (metrics["min_text_height_in"], TH_TEXT))
+
     if metrics["min_line_weight_in"] is not None:
         margins["line_in"] = metrics["min_line_weight_in"] - TH_LINE
         if metrics["min_line_weight_in"] < TH_LINE:
             failed.append("line")
-            why.append('Line min %.3f" (< %.3f").' %
-                       (metrics["min_line_weight_in"], TH_LINE))
+            why.append('Line min %.3f" (< %.3f").' % (metrics["min_line_weight_in"], TH_LINE))
+
     margins["negative_space_in"] = metrics["min_negative_space_in"] - TH_GAP
     if metrics["min_negative_space_in"] < TH_GAP:
         failed.append("negative_space")
-        why.append('Negative space min %.3f" (< %.3f").' %
-                   (metrics["min_negative_space_in"], TH_GAP))
+        why.append('Negative space min %.3f" (< %.3f").' % (metrics["min_negative_space_in"], TH_GAP))
 
     ratios=[]
     if metrics["min_text_height_in"] is not None:    ratios.append(metrics["min_text_height_in"]/TH_TEXT)
@@ -563,7 +452,7 @@ def run_png_qa_core(png_bytes, params):
 @app.route("/png-qa", methods=["POST"])
 def png_qa():
     try:
-        # params
+        params = {}
         if request.is_json:
             params = request.get_json(silent=True) or {}
         else:
@@ -572,7 +461,6 @@ def png_qa():
             except Exception:
                 params = {}
 
-        # bytes: multipart "file" first, then base64 fallback
         png_bytes=None
         f = request.files.get("file")
         if f: png_bytes = f.read()
@@ -581,8 +469,7 @@ def png_qa():
             if isinstance(b64,str):
                 s=b64.strip()
                 if s.startswith("data:"): s=s.split(",",1)[1] if "," in s else ""
-                s="".join(s.split())
-                pad=(-len(s))%4
+                s="".join(s.split()); pad=(-len(s))%4
                 if pad: s+="="*pad
                 try:
                     png_bytes = base64.b64decode(s, validate=False)
@@ -601,4 +488,5 @@ def healthz():
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
