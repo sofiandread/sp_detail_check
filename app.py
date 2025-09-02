@@ -1,4 +1,3 @@
-# app.py — PNG Raster Detail QA service (Flask)
 from flask import Flask, request, jsonify
 import base64, zlib, struct, math, os
 
@@ -214,6 +213,7 @@ def inset_roi(roi, inset):
     if xa<=xi or ya<=yi: return roi
     return (xi,yi,xa,ya)
 
+# ---------- measurements ----------
 def measure_min_line_and_gap_pos(ink,w,h,roi=None):
     if roi is None:
         minX,minY,maxX,maxY=bbox_of_ink(ink,w,h)
@@ -290,51 +290,62 @@ def measure_min_line_and_gap_pos(ink,w,h,roi=None):
 
     return int(min_line), int(min_gap), pos_line, pos_gap
 
-def estimate_min_text_height_px(ink,w,h,roi=None):
-    if roi is None:
-        minX,minY,maxX,maxY=bbox_of_ink(ink,w,h)
-    else:
-        minX,minY,maxX,maxY=roi
-    if maxX<minX or maxY<minY: return None
-    lab=[0]*(w*h); heights=[]; stack=[]; label=0
-    for y in range(minY,maxY+1):
-        for x in range(minX,maxX+1):
-            idx=y*w+x
+def estimate_min_text_height_px_filtered(ink,w,h,roi, ppi):
+    """Return a robust small text height in px, ignoring specks and edge nicks."""
+    x0,y0,x1,y1 = roi
+    if x1<x0 or y1<y0:
+        return None, 0
+
+    # thresholds
+    min_h_px = max(int(round(ppi*0.06)), 6)           # ignore comps shorter than ~0.06" or 6 px
+    min_area_px = max(int(round((ppi*ppi)*0.003)), 40) # ignore tiny areas
+    heights=[]; kept=0
+
+    W=w; H=h
+    lab=[0]*(W*H); stack=[]; label=0
+    for y in range(y0,y1+1):
+        for x in range(x0,x1+1):
+            idx=y*W+x
             if ink[idx]==0 or lab[idx]!=0: continue
-            label+=1; miny=y; maxy=y
+            label+=1
             lab[idx]=label; stack.append((x,y))
+            minx=maxx=x; miny=maxy=y; area=0
+            touch_edge=False
             while stack:
-                cx,cy=stack.pop(); cidx=cy*w+cx
+                cx,cy=stack.pop(); cidx=cy*W+cx
+                area+=1
+                if cx<minx:minx=cx
+                if cx>maxx:maxx=cx
                 if cy<miny:miny=cy
                 if cy>maxy:maxy=cy
-                if cx>minX:
-                    n=cidx-1
-                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx-1,cy))
-                if cx<maxX:
-                    n=cidx+1
-                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx+1,cy))
-                if cy>minY:
-                    n=cidx-w
-                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy-1))
-                if cy<maxY:
-                    n=cidx+w
-                    if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy+1))
+                # 4-neighborhood
+                if cx>x0 and ink[cidx-1]==1 and lab[cidx-1]==0: lab[cidx-1]=label; stack.append((cx-1,cy))
+                if cx<x1 and ink[cidx+1]==1 and lab[cidx+1]==0: lab[cidx+1]=label; stack.append((cx+1,cy))
+                if cy>y0 and ink[cidx-W]==1 and lab[cidx-W]==0: lab[cidx-W]=label; stack.append((cx,cy-1))
+                if cy<y1 and ink[cidx+W]==1 and lab[cidx+W]==0: lab[cidx+W]=label; stack.append((cx,cy+1))
+                # edge contact?
+                if cx==x0 or cx==x1 or cy==y0 or cy==y1:
+                    touch_edge=True
             hgt=maxy-miny+1
-            if hgt>=1: heights.append(hgt)
-    return percentile(heights,0.10) if heights else None
+            if (not touch_edge) and hgt>=min_h_px and area>=min_area_px:
+                heights.append(hgt); kept+=1
 
-# ---------- core QA ----------
+    if not heights: 
+        return None, 0
+    return percentile(heights, 0.25), kept  # 25th percentile of filtered components
+
+# ---------- core ----------
 def run_png_qa_core(png_bytes, params):
-    width, height, gray = decode_png_to_gray(png_bytes)
+    w, h, gray = decode_png_to_gray(png_bytes)
 
     thr = otsu_threshold(gray)
     ink_raw = [1 if g < thr else 0 for g in gray]
 
     ignore_border = int(max(0, fnum(params.get("ignore_border_px"), 0)))
-    ink_no_border = zero_border(ink_raw, width, height, ignore_border)
+    ink_nb = zero_border(ink_raw, w, h, ignore_border)
 
-    roi = bbox_of_ink(ink_no_border, width, height)
-    roi = clamp_roi(*roi, width, height)
+    roi = bbox_of_ink(ink_nb, w, h)
+    roi = clamp_roi(*roi, w, h)
     roi_w = max(0, roi[2]-roi[0]+1); roi_h = max(0, roi[3]-roi[1]+1)
 
     # ppi
@@ -347,96 +358,77 @@ def run_png_qa_core(png_bytes, params):
             if pw and pw>0: px_per_in = roi_w / pw
             elif ph and ph>0: px_per_in = roi_h / ph
         if not px_per_in:
-            if pw and pw>0: px_per_in = width / pw
-            elif ph and ph>0: px_per_in = height / ph
+            if pw and pw>0: px_per_in = w / pw
+            elif ph and ph>0: px_per_in = h / ph
             else: px_per_in = 300.0
 
     # insets & guards
     user_inset_px = int(max(0, fnum(params.get("inset_px"), 0)))
-    inset_frac     = fnum(params.get("inset_frac"), 0.02)   # 2% of ROI
+    inset_frac     = fnum(params.get("inset_frac"), 0.02)    # 2% of ROI
     auto_inset_px  = int(round(min(roi_w, roi_h) * inset_frac)) if roi_w and roi_h else 0
-    ppi_inset_px   = int(round(px_per_in * 0.01))           # 1% of ppi
+    ppi_inset_px   = int(round(px_per_in * 0.01))            # 1% of ppi
     base_inset     = max(user_inset_px, auto_inset_px, ppi_inset_px)
 
-    edge_guard_px  = int(max(0, fnum(params.get("edge_guard_px"), 8)))  # NEW
+    edge_guard_px  = int(max(0, fnum(params.get("edge_guard_px"), 12)))
     effective_inset = base_inset + edge_guard_px
-
     roi_interior = inset_roi(roi, effective_inset)
 
     # cleaning / alias tolerance
     alias_px = int(max(1, fnum(params.get("gap_alias_px"), 2)))
-    ink_clean  = majority3x3(ink_no_border, width, height)
-    ink_closed = closing(ink_clean, width, height, alias_px)
+    ink_clean  = majority3x3(ink_nb, w, h)
+    ink_closed = closing(ink_clean, w, h, alias_px)
 
     # measure inside guarded interior
     min_line_px_raw, _mg_unused, pos_line_raw, _pg_unused = \
-        measure_min_line_and_gap_pos(ink_no_border, width, height, roi_interior)
+        measure_min_line_and_gap_pos(ink_nb, w, h, roi_interior)
     _ml_closed, min_gap_px_closed, _pl_unused, pos_gap_closed = \
-        measure_min_line_and_gap_pos(ink_closed, width, height, roi_interior)
-    min_text_px = estimate_min_text_height_px(ink_no_border, width, height, roi_interior)
+        measure_min_line_and_gap_pos(ink_closed, w, h, roi_interior)
 
-    # enforce minimum meaningful span for gaps (size-aware)
-    default_min_span_px = int(max(6, round(px_per_in * 0.01), alias_px*4))
-    min_gap_span_px     = int(max(3, fnum(params.get("min_gap_span_px"), default_min_span_px)))
-    if pos_gap_closed and pos_gap_closed.get("len_px", 1_000_000) < min_gap_span_px:
-        min_gap_px_closed = max(min_gap_px_closed, min_gap_span_px)
+    # text height with filtering
+    min_text_px_filtered, comp_used = estimate_min_text_height_px_filtered(
+        ink_nb, w, h, roi_interior, px_per_in
+    )
 
-    min_line_px = min_line_px_raw
-    min_gap_px  = max(min_gap_px_closed, alias_px)
-
-    # thresholds (inches)
+    # span floor for gaps in px: at least the spec gap in px
     TH_TEXT = num(params.get("min_text_height_in"),    0.10)
     TH_GAP  = num(params.get("min_negative_space_in"), 1.0/72.0)
     TH_LINE = num(params.get("min_line_weight_in"),    0.005)
 
-    metrics = {
-        "width_px": width, "height_px": height,
-        "roi": {"x0": roi[0], "y0": roi[1], "x1": roi[2], "y1": roi[3], "w": roi_w, "h": roi_h},
-        "roi_interior": {
-            "x0": roi_interior[0], "y0": roi_interior[1],
-            "x1": roi_interior[2], "y1": roi_interior[3],
-            "w": max(0, roi_interior[2]-roi_interior[0]+1),
-            "h": max(0, roi_interior[3]-roi_interior[1]+1),
-        },
-        "px_per_in": px_per_in, "used_px_per_in": px_per_in,
-        "min_line_weight_in":    (min_line_px / px_per_in) if min_line_px > 0 else None,
-        "min_negative_space_in": (min_gap_px  / px_per_in) if min_gap_px  > 0 else (1.0/72.0),
-        "min_text_height_in":    (min_text_px / px_per_in) if (min_text_px is not None) else None,
-        "alias_px": alias_px,
-        "text_min_comp_px": default_min_span_px,
-        "gap_threshold_px": TH_GAP * px_per_in,
-        "debug_min_gap":  pos_gap_closed,
-        "debug_min_line": pos_line_raw,
-        "ignore_border_px": ignore_border,
-        "effective_inset_px": effective_inset,
-        "edge_guard_px": edge_guard_px,
-        "use_roi_for_ppi": use_roi_ppi
-    }
+    spec_gap_px = math.ceil(TH_GAP * px_per_in)
+    min_gap_span_px = int(max(spec_gap_px, fnum(params.get("min_gap_span_px"), spec_gap_px)))
+    if pos_gap_closed and pos_gap_closed.get("len_px", 0) < min_gap_span_px:
+        min_gap_px_closed = max(min_gap_px_closed, min_gap_span_px)
 
-    failed=[]; why=[]
-    margins = {}
+    # final px metrics
+    min_line_px = min_line_px_raw
+    min_gap_px  = max(min_gap_px_closed, alias_px)
 
-    if metrics["min_text_height_in"] is not None:
-        margins["text_in"] = metrics["min_text_height_in"] - TH_TEXT
-        if metrics["min_text_height_in"] < TH_TEXT:
+    # convert to inches with half-px tolerance
+    min_line_in = (min_line_px + 0.5)/px_per_in if min_line_px>0 else None
+    min_gap_in  = (min_gap_px  + 0.5)/px_per_in if min_gap_px >0 else (1.0/72.0)
+    min_text_in = (min_text_px_filtered/px_per_in) if (min_text_px_filtered is not None) else None
+
+    # pass/fail
+    failed=[]; why=[]; margins={}
+    if min_text_in is not None:
+        margins["text_in"] = min_text_in - TH_TEXT
+        if min_text_in < TH_TEXT:
             failed.append("text")
-            why.append('Smallest text is %.3f" (< %.3f").' % (metrics["min_text_height_in"], TH_TEXT))
-
-    if metrics["min_line_weight_in"] is not None:
-        margins["line_in"] = metrics["min_line_weight_in"] - TH_LINE
-        if metrics["min_line_weight_in"] < TH_LINE:
+            why.append('Smallest text is %.3f" (< %.3f").' % (min_text_in, TH_TEXT))
+    if min_line_in is not None:
+        margins["line_in"] = min_line_in - TH_LINE
+        if min_line_in < TH_LINE:
             failed.append("line")
-            why.append('Line min %.3f" (< %.3f").' % (metrics["min_line_weight_in"], TH_LINE))
-
-    margins["negative_space_in"] = metrics["min_negative_space_in"] - TH_GAP
-    if metrics["min_negative_space_in"] < TH_GAP:
+            why.append('Line min %.3f" (< %.3f").' % (min_line_in, TH_LINE))
+    margins["negative_space_in"] = min_gap_in - TH_GAP
+    if min_gap_in < TH_GAP:
         failed.append("negative_space")
-        why.append('Negative space min %.3f" (< %.3f").' % (metrics["min_negative_space_in"], TH_GAP))
+        why.append('Negative space min %.3f" (< %.3f").' % (min_gap_in, TH_GAP))
 
     ratios=[]
-    if metrics["min_text_height_in"] is not None:    ratios.append(metrics["min_text_height_in"]/TH_TEXT)
-    if metrics["min_line_weight_in"] is not None:    ratios.append(metrics["min_line_weight_in"]/TH_LINE)
-    if metrics["min_negative_space_in"] is not None: ratios.append(metrics["min_negative_space_in"]/TH_GAP)
+    if min_text_in is not None: ratios.append(min_text_in/TH_TEXT)
+    if min_line_in is not None: ratios.append(min_line_in/TH_LINE)
+    if min_gap_in is not None:  ratios.append(min_gap_in /TH_GAP)
     confidence = max(0.0, min(1.0, min(ratios))) if ratios else 1.0
 
     return {
@@ -445,7 +437,31 @@ def run_png_qa_core(png_bytes, params):
         "why": " ".join(why) if why else "All detail rules met.",
         "failed_parts": failed,
         "confidence": confidence,
-        "metrics": {**metrics, "margins_in": margins}
+        "metrics": {
+            "width_px": w, "height_px": h,
+            "roi": {"x0": roi[0], "y0": roi[1], "x1": roi[2], "y1": roi[3], "w": roi_w, "h": roi_h},
+            "roi_interior": {
+                "x0": roi_interior[0], "y0": roi_interior[1],
+                "x1": roi_interior[2], "y1": roi_interior[3],
+                "w": max(0, roi_interior[2]-roi_interior[0]+1),
+                "h": max(0, roi_interior[3]-roi_interior[1]+1),
+            },
+            "px_per_in": px_per_in, "used_px_per_in": px_per_in,
+            "alias_px": alias_px,
+            "edge_guard_px": edge_guard_px,
+            "effective_inset_px": effective_inset,
+            "spec_gap_px": spec_gap_px,
+            "min_gap_span_px": min_gap_span_px,
+            "min_line_weight_in":   min_line_in,
+            "min_negative_space_in":min_gap_in,
+            "min_text_height_in":   min_text_in,
+            "text_components_used": comp_used,
+            "debug_min_gap":  pos_gap_closed,
+            "debug_min_line": pos_line_raw,
+            "ignore_border_px": ignore_border,
+            "use_roi_for_ppi": use_roi_ppi,
+            "margins_in": margins
+        }
     }
 
 # ---------- routes ----------
