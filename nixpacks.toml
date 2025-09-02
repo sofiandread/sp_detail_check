@@ -1,2 +1,6 @@
 [phases.setup]
-nixPkgs = ["tesseract"]
+# Ensure Python + Tesseract are present
+nixPkgs = ["python311", "tesseract"]
+
+[variables]
+PYTHONUNBUFFERED = "1"
