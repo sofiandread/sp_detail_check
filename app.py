@@ -1,15 +1,18 @@
 # app.py — PNG Raster Detail QA service (Flask)
 # POST /png-qa
 #   Accepts multipart "file" OR JSON/form with "cutout_b64"
-#   Optional text fields: px_per_in, print_width_in, print_height_in,
-#   min_text_height_in, min_negative_space_in, min_line_weight_in,
-#   gap_alias_px, ignore_border_px, use_roi_for_ppi, text_min_comp_px
+#   Optional params:
+#     px_per_in, print_width_in, print_height_in,
+#     min_text_height_in, min_negative_space_in, min_line_weight_in,
+#     gap_alias_px, ignore_border_px, use_roi_for_ppi,
+#     use_ocr_for_text, ocr_lang, ocr_min_conf, ocr_psm,
+#     text_min_comp_px, text_percentile
 #
-# Returns JSON with: ok, design_passed, why, failed_parts, confidence,
-# metrics {... incl. debug_min_gap/line with positions, margins_in, etc.}
+# Returns JSON: ok, design_passed, why, failed_parts, confidence,
+# metrics {... incl. px_per_in used, debug_min_* positions, roi_interior, text_source, etc.}
 
 from flask import Flask, request, jsonify
-import base64, zlib, struct, math
+import base64, zlib, struct, math, tempfile, subprocess, os
 
 app = Flask(__name__)
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -210,6 +213,13 @@ def closing(ink,w,h,radius_px):
         out=erode1(out,w,h)
     return out
 
+def opening(ink,w,h,radius_px):
+    out=ink[:]
+    for _ in range(max(0,int(radius_px))):
+        out=erode1(out,w,h)
+        out=dilate1(out,w,h)
+    return out
+
 def inset_roi(roi, w, h, inset):
     if inset<=0: return roi
     x0,y0,x1,y1 = roi
@@ -302,7 +312,7 @@ def measure_min_line_and_gap_pos(ink,w,h,roi):
 
     return int(min_line), int(min_gap), pos_line, pos_gap
 
-def estimate_min_text_height_px_filtered(ink,w,h,roi=None,min_comp_px=5):
+def estimate_min_text_height_px_filtered(ink,w,h,roi=None,min_comp_px=6,pctl=0.20):
     if roi is None:
         roi=bbox_of_ink(ink,w,h)
     x0,y0,x1,y1=roi
@@ -336,10 +346,68 @@ def estimate_min_text_height_px_filtered(ink,w,h,roi=None,min_comp_px=5):
                     n=cidx+w
                     if ink[n]==1 and lab[n]==0: lab[n]=label; stack.append((cx,cy+1))
             comp_w=maxx-minx+1; comp_h=maxy-miny+1
-            comp_min=min(comp_w, comp_h); comp_area=comp_w*comp_h
-            if comp_min>=min_comp_px and comp_area>=(min_comp_px*min_comp_px//2):
+            comp_min=min(comp_w, comp_h)
+            comp_area=comp_w*comp_h
+            if comp_min>=min_comp_px and comp_area >= (min_comp_px*min_comp_px):
                 heights.append(comp_h)
-    return percentile(heights,0.10) if heights else None
+    if not heights: return None
+    return percentile(heights, pctl)
+
+# ---------- OCR (Tesseract CLI) ----------
+def ocr_word_heights_from_png_bytes(png_bytes, roi=None, lang='eng', min_conf=70, psm='6'):
+    """Return list of OCR word heights (px) inside ROI using tesseract TSV."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            f.write(png_bytes)
+            tmp_path = f.name
+
+        cmd = ['tesseract', tmp_path, 'stdout', '--psm', str(psm), '-l', lang, 'tsv']
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        if res.returncode != 0 or not res.stdout:
+            return []
+
+        lines = res.stdout.splitlines()
+        if not lines:
+            return []
+
+        headers = lines[0].split('\t')
+        idx = {h: i for i, h in enumerate(headers)}
+        needed = {'level','conf','left','top','width','height'}
+        if not needed.issubset(idx):
+            return []
+
+        if roi:
+            x0,y0,x1,y1 = roi
+        else:
+            x0=y0=0; x1=y1=10**9
+
+        heights=[]
+        for line in lines[1:]:
+            parts = line.split('\t')
+            if len(parts) < len(headers): continue
+            try:
+                level = int(parts[idx['level']])
+                if level != 5:  # word level
+                    continue
+                conf = float(parts[idx['conf']])
+                if conf < float(min_conf):
+                    continue
+                L = int(parts[idx['left']]); T = int(parts[idx['top']])
+                W = int(parts[idx['width']]); H = int(parts[idx['height']])
+                if W <= 0 or H <= 0: continue
+                if (L > x1) or (T > y1) or (L+W < x0) or (T+H < y0):
+                    continue
+                heights.append(H)
+            except Exception:
+                continue
+        return heights
+    except Exception:
+        return []
 
 # ---------- core QA ----------
 def run_png_qa_core(png_bytes, params):
@@ -371,7 +439,7 @@ def run_png_qa_core(png_bytes, params):
     ink_clean  = majority3x3(ink_no_border, width, height)
     ink_closed = closing(ink_clean, width, height, alias_px)
 
-    # *** NEW: inset interior ROI to avoid seam at the edge
+    # interior ROI to avoid thin seam at the crop edges
     safety_inset_px = max(
         alias_px,
         ignore_border,
@@ -379,7 +447,7 @@ def run_png_qa_core(png_bytes, params):
     )
     roi_interior = inset_roi(roi, width, height, safety_inset_px)
 
-    # measure inside interior ROI
+    # ---- line & gap inside interior ROI
     min_line_px_raw, _mg_unused, pos_line_raw, _pg_unused = measure_min_line_and_gap_pos(
         ink_clean, width, height, roi_interior
     )
@@ -387,24 +455,52 @@ def run_png_qa_core(png_bytes, params):
         ink_closed, width, height, roi_interior
     )
 
-    # text height with filtered components inside interior ROI
-    text_min_comp_px = int(max(
-        fnum(params.get("text_min_comp_px"), 0) or 0,
-        5,
-        round(px_per_in * 0.02)  # ~2% of an inch in pixels
-    ))
-    min_text_px = estimate_min_text_height_px_filtered(
-        ink_closed, width, height, roi_interior, min_comp_px=text_min_comp_px
-    )
+    # ----- TEXT HEIGHT: prefer OCR, then fallback to morphology
+    min_text_px = None
+    text_source = "morph"
+
+    if truthy(params.get("use_ocr_for_text")):
+        ocr_lang = params.get("ocr_lang", "eng")
+        ocr_conf = int(max(0, fnum(params.get("ocr_min_conf"), 70)))
+        ocr_psm  = str(params.get("ocr_psm", "6"))
+        word_heights = ocr_word_heights_from_png_bytes(
+            png_bytes, roi=roi_interior, lang=ocr_lang, min_conf=ocr_conf, psm=ocr_psm
+        )
+        if word_heights:
+            min_keep = max(6, int(round(px_per_in * 0.04)))         # ~4% inch
+            max_keep = int(round(px_per_in * 1.25))                 # cap giant boxes
+            clean = [h for h in word_heights if min_keep <= h <= max_keep]
+            if clean:
+                text_pctl = fnum(params.get("text_percentile"), 0.20)
+                text_pctl = min(max(text_pctl, 0.05), 0.5)
+                min_text_px = percentile(clean, text_pctl)
+                text_source = "ocr"
+
+    if min_text_px is None:
+        text_open_r = max(alias_px, int(round(px_per_in * 0.02)))   # ~2% inch
+        ink_for_text = opening(ink_closed, width, height, text_open_r)
+
+        user_min_comp = int(max(0, fnum(params.get("text_min_comp_px"), 0) or 0))
+        min_comp_px = max(user_min_comp, 6, int(round(px_per_in * 0.04)))  # ~4% inch
+
+        text_pctl = fnum(params.get("text_percentile"), 0.20)      # 20th percentile
+        text_pctl = min(max(text_pctl, 0.05), 0.5)
+
+        min_text_px = estimate_min_text_height_px_filtered(
+            ink_for_text, width, height, roi_interior, min_comp_px=min_comp_px, pctl=text_pctl
+        )
+        text_source = "morph"
 
     # robust minima
     min_line_px = max(min_line_px_raw, alias_px)
     min_gap_px  = max(min_gap_px_closed, alias_px)
 
-    TH_TEXT = num(params.get("min_text_height_in"),    0.10)
-    TH_GAP  = num(params.get("min_negative_space_in"), 1.0/72.0)
-    TH_LINE = num(params.get("min_line_weight_in"),    0.005)
+    # thresholds
+    TH_TEXT = num(params.get("min_text_height_in"),    0.10)       # 0.10 in
+    TH_GAP  = num(params.get("min_negative_space_in"), 1.0/72.0)   # 1 pt
+    TH_LINE = num(params.get("min_line_weight_in"),    0.005)      # 0.005 in
 
+    # metrics (in inches)
     metrics = {
         "width_px": width,
         "height_px": height,
@@ -425,9 +521,10 @@ def run_png_qa_core(png_bytes, params):
         "debug_min_line": pos_line_raw,
         "ignore_border_px": ignore_border,
         "use_roi_for_ppi": use_roi_ppi,
-        "text_min_comp_px": text_min_comp_px
+        "text_source": text_source
     }
 
+    # pass/fail + margins
     failed=[]; why=[]; margins={}
     if metrics["min_text_height_in"] is not None:
         margins["text_in"] = metrics["min_text_height_in"] - TH_TEXT
@@ -466,7 +563,7 @@ def run_png_qa_core(png_bytes, params):
 @app.route("/png-qa", methods=["POST"])
 def png_qa():
     try:
-        params = {}
+        # params
         if request.is_json:
             params = request.get_json(silent=True) or {}
         else:
@@ -475,6 +572,7 @@ def png_qa():
             except Exception:
                 params = {}
 
+        # bytes: multipart "file" first, then base64 fallback
         png_bytes=None
         f = request.files.get("file")
         if f: png_bytes = f.read()
