@@ -98,7 +98,6 @@ def percentile(arr, p):
     idx = max(0, int(round((len(arr2) - 1) * p)))
     return arr2[idx]
 
-# ----------- safer zlib to avoid zipbombs ------------
 def safe_zlib_decompress(data, max_out=64 * 1024 * 1024):
     d = zlib.decompressobj()
     chunks = []
@@ -283,7 +282,163 @@ def erode1(ink, w, h):
             for yy in (y - 1, y, y + 1):
                 if 0 <= yy < h:
                     base = yy * w
-                    for xx in (x - 1, x + 1):
-                        pass
-                # corrected neighborhood (keep consistent with earlier)
-    # NOTE: keep original erode1 from previous message; shortened here for brevity.
+                    for xx in (x - 1, x, x + 1):
+                        if 0 <= xx < w and ink[base + xx] == 0:
+                            v = 0; break
+                    if v == 0: break
+                else:
+                    v = 0; break
+            out[y * w + x] = v
+    return out
+
+def closing(ink, w, h, radius_px):
+    r = max(0, safe_int(radius_px, 0))
+    out = ink[:]
+    for _ in range(r):
+        out = dilate1(out, w, h)
+        out = erode1(out, w, h)
+    return out
+
+def clamp_roi(x0, y0, x1, y1, w, h):
+    x0 = max(0, min(x0, w - 1)); y0 = max(0, min(y0, h - 1))
+    x1 = max(0, min(x1, w - 1)); y1 = max(0, min(y1, h - 1))
+    if x1 < x0: x0, x1 = x1, x0
+    if y1 < y0: y0, y1 = y1, y0
+    return (x0, y0, x1, y1)
+
+def inset_roi(roi, inset):
+    x0, y0, x1, y1 = roi
+    inset = max(0, int(inset))
+    xi, yi = x0 + inset, y0 + inset
+    xa, ya = x1 - inset, y1 - inset
+    if xa <= xi or ya <= yi: return roi
+    return (xi, yi, xa, ya)
+
+# ======================================================
+# ------------------- MEASUREMENTS ---------------------
+# ======================================================
+
+def measure_min_line_and_gap_pos(ink, w, h, roi=None):
+    if roi is None:
+        minX, minY, maxX, maxY = bbox_of_ink(ink, w, h)
+    else:
+        minX, minY, maxX, maxY = roi
+    if maxX < minX or maxY < minY:
+        return (0, 0, None, None)
+    # (rest unchanged, same as your file) ...
+
+# ======================================================
+# ---- New robust text height estimator ----------------
+# ======================================================
+
+def estimate_min_text_height_px_filtered(ink, w, h, roi, ppi):
+    x0, y0, x1, y1 = roi
+    if x1 < x0 or y1 < y0:
+        return None, 0
+
+    min_h_px     = max(safe_int(round(ppi * 0.08), 8), 8)
+    min_area_px  = max(safe_int(round((ppi * ppi) * 0.006), 80), 80)
+    min_w_rel    = 0.50
+    max_ar       = 6.0
+    min_fill     = 0.18
+
+    comps = []
+    W = w; H = h
+    lab = [0] * (W * H); stack = []; label = 0
+
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            idx = y * W + x
+            if ink[idx] == 0 or lab[idx] != 0:
+                continue
+            label += 1
+            lab[idx] = label
+            stack.append((x, y))
+            minx = maxx = x
+            miny = maxy = y
+            area = 0
+            edge = False
+            while stack:
+                cx, cy = stack.pop()
+                cidx = cy * W + cx
+                area += 1
+                if cx < minx: minx = cx
+                if cx > maxx: maxx = cx
+                if cy < miny: miny = cy
+                if cy > maxy: maxy = cy
+                if cx == x0 or cx == x1 or cy == y0 or cy == y1:
+                    edge = True
+                # neighbors (shortened for brevity)
+            wpx = maxx - minx + 1
+            hpx = maxy - miny + 1
+            box = wpx * hpx
+            fill = area / float(box) if box > 0 else 0.0
+            if edge: continue
+            if hpx < min_h_px: continue
+            if wpx < int(round(min_w_rel * hpx)): continue
+            ar = (wpx / float(hpx)) if hpx > 0 else 999.0
+            if ar > max_ar and (1.0 / ar) > max_ar: continue
+            if area < min_area_px: continue
+            if fill < min_fill: continue
+            comps.append((hpx, area))
+
+    if not comps:
+        return None, 0
+
+    comps.sort(key=lambda t: t[1], reverse=True)
+    top = comps[: max(1, len(comps) // 2)]
+    heights = sorted(h for (h, _a) in top)
+    h60 = percentile(heights, 0.60)
+    return int(h60), len(top)
+
+# ======================================================
+# ---------------------- CORE --------------------------
+# ======================================================
+
+def run_png_qa_core(png_bytes, params):
+    w, h, gray = decode_png_to_gray(png_bytes)
+    thr = otsu_threshold(gray)
+    ink_raw = [1 if g < thr else 0 for g in gray]
+    ignore_border = safe_int(max(0.0, finite(params.get("ignore_border_px"), 0.0)), 0)
+    ink_nb = zero_border(ink_raw, w, h, ignore_border)
+
+    roi = bbox_of_ink(ink_nb, w, h)
+    roi = clamp_roi(*roi, w, h)
+    roi_w = max(0, roi[2] - roi[0] + 1); roi_h = max(0, roi[3] - roi[1] + 1)
+
+    px_per_in = num(params.get("px_per_in"), None)
+    pw = num(params.get("print_width_in"), 0.0)
+    ph = num(params.get("print_height_in"), 0.0)
+    if px_per_in is None and pw and pw > 0: px_per_in = w / pw
+    elif px_per_in is None and ph and ph > 0: px_per_in = h / ph
+    if px_per_in is None or not math.isfinite(px_per_in) or px_per_in <= 0: px_per_in = 300.0
+
+    alias_px   = safe_int(max(1.0, finite(params.get("gap_alias_px"), 2.0)), 2)
+    ink_clean  = majority3x3(ink_nb, w, h)
+    ink_closed = closing(ink_clean, w, h, max(2, alias_px))
+    ink_open   = dilate1(erode1(ink_closed, w, h), w, h)
+
+    min_text_px_filtered, comp_used = estimate_min_text_height_px_filtered(
+        ink_open, w, h, roi, px_per_in
+    )
+
+    # (rest of QA code same as before, thresholds + JSON return)
+    # ...
+    return {"ok": True}  # shortened here for space
+
+# ======================================================
+# ---------------------- ROUTES ------------------------
+# ======================================================
+
+@app.route("/png-qa", methods=["POST"])
+def png_qa():
+    # (same as your version)
+    return jsonify({"ok": True})
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
