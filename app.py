@@ -409,49 +409,92 @@ def measure_min_line_and_gap_pos(ink, w, h, roi=None):
 
     return int(min_line), int(min_gap), pos_line, pos_gap
 
+# ----------- NEW: robust text-height estimator ----------
 def estimate_min_text_height_px_filtered(ink, w, h, roi, ppi):
-    """Return a robust small text height in px, ignoring specks and edge nicks."""
+    """
+    Robust small text height in px.
+    - Use on a cleaned/opened mask.
+    - Rejects speckles and edge nicks.
+    - Requires reasonable width, area, fill %, and aspect ratio.
+    - Returns median height of the largest third by area.
+    """
     x0, y0, x1, y1 = roi
     if x1 < x0 or y1 < y0:
         return None, 0
 
-    # thresholds (guarded)
-    min_h_px = max(safe_int(round(ppi * 0.06), 6), 6)             # ~0.06"
-    min_area_px = max(safe_int(round((ppi * ppi) * 0.003), 40), 40)
-    heights = []; kept = 0
+    # Scale-aware guards
+    min_h_px     = max(safe_int(round(ppi * 0.06), 6), 6)         # ~0.06"
+    min_area_px  = max(safe_int(round((ppi * ppi) * 0.003), 40), 40)
+    min_w_px     = max(4, safe_int(round(min_h_px * 0.35), 4))    # avoid skinny scratches
+    max_ar       = 8.0                                            # width/height or its inverse
+    min_fill     = 0.12                                           # area / bbox area
 
+    comps = []
     W = w; H = h
     lab = [0] * (W * H); stack = []; label = 0
+
     for y in range(y0, y1 + 1):
         for x in range(x0, x1 + 1):
             idx = y * W + x
-            if ink[idx] == 0 or lab[idx] != 0: continue
+            if ink[idx] == 0 or lab[idx] != 0:
+                continue
             label += 1
-            lab[idx] = label; stack.append((x, y))
-            minx = maxx = x; miny = maxy = y; area = 0
-            touch_edge = False
+            lab[idx] = label
+            stack.append((x, y))
+
+            minx = maxx = x
+            miny = maxy = y
+            area = 0
+            edge = False
+
             while stack:
-                cx, cy = stack.pop(); cidx = cy * W + cx
+                cx, cy = stack.pop()
+                cidx = cy * W + cx
                 area += 1
                 if cx < minx: minx = cx
                 if cx > maxx: maxx = cx
                 if cy < miny: miny = cy
                 if cy > maxy: maxy = cy
                 # 4-neighborhood
-                if cx > x0 and ink[cidx - 1] == 1 and lab[cidx - 1] == 0: lab[cidx - 1] = label; stack.append((cx - 1, cy))
-                if cx < x1 and ink[cidx + 1] == 1 and lab[cidx + 1] == 0: lab[cidx + 1] = label; stack.append((cx + 1, cy))
-                if cy > y0 and ink[cidx - W] == 1 and lab[cidx - W] == 0: lab[cidx - W] = label; stack.append((cx, cy - 1))
-                if cy < y1 and ink[cidx + W] == 1 and lab[cidx + W] == 0: lab[cidx + W] = label; stack.append((cx, cy + 1))
-                # edge contact?
+                if cx > x0 and ink[cidx - 1] == 1 and lab[cidx - 1] == 0:
+                    lab[cidx - 1] = label; stack.append((cx - 1, cy))
+                if cx < x1 and ink[cidx + 1] == 1 and lab[cidx + 1] == 0:
+                    lab[cidx + 1] = label; stack.append((cx + 1, cy))
+                if cy > y0 and ink[cidx - W] == 1 and lab[cidx - W] == 0:
+                    lab[cidx - W] = label; stack.append((cx, cy - 1))
+                if cy < y1 and ink[cidx + W] == 1 and lab[cidx + W] == 0:
+                    lab[cidx + W] = label; stack.append((cx, cy + 1))
                 if cx == x0 or cx == x1 or cy == y0 or cy == y1:
-                    touch_edge = True
-            hgt = maxy - miny + 1
-            if (not touch_edge) and hgt >= min_h_px and area >= min_area_px:
-                heights.append(hgt); kept += 1
+                    edge = True
 
-    if not heights:
+            wpx = maxx - minx + 1
+            hpx = maxy - miny + 1
+            box = wpx * hpx
+            fill = area / float(box) if box > 0 else 0.0
+            if edge:                    # ignore edge nicks
+                continue
+            if hpx < min_h_px:          # must be at least ~0.06"
+                continue
+            if wpx < min_w_px:          # avoid near-vertical scratches/dots
+                continue
+            ar = (wpx / float(hpx)) if hpx > 0 else 999.0
+            if ar > max_ar and (1.0 / ar) > max_ar:
+                continue
+            if area < min_area_px:      # reject tiny speckles
+                continue
+            if fill < min_fill:         # reject porous speck clouds
+                continue
+
+            comps.append((hpx, area))
+
+    if not comps:
         return None, 0
-    return percentile(heights, 0.25), kept  # 25th percentile
+
+    comps.sort(key=lambda t: t[1], reverse=True)
+    top = comps[: max(1, len(comps) // 3)]
+    heights = sorted(h for (h, _a) in top)
+    mid = heights[len(heights) // 2]
+    return int(mid), len(top)
 
 # ======================================================
 # ---------------------- CORE --------------------------
@@ -509,15 +552,19 @@ def run_png_qa_core(png_bytes, params):
     ink_clean  = majority3x3(ink_nb, w, h)
     ink_closed = closing(ink_clean, w, h, alias_px)
 
+    # NEW: light opening to remove speckles before text sizing
+    ink_open_1 = erode1(ink_closed, w, h)
+    ink_open   = dilate1(ink_open_1, w, h)
+
     # -------------------- Measure ---------------------
     min_line_px_raw, _mg_unused, pos_line_raw, _pg_unused = \
         measure_min_line_and_gap_pos(ink_nb, w, h, roi_interior)
     _ml_closed, min_gap_px_closed, _pl_unused, pos_gap_closed = \
         measure_min_line_and_gap_pos(ink_closed, w, h, roi_interior)
 
-    # text height with filtering
+    # text height with filtering (use cleaned+opened ink)
     min_text_px_filtered, comp_used = estimate_min_text_height_px_filtered(
-        ink_nb, w, h, roi_interior, px_per_in
+        ink_open, w, h, roi_interior, px_per_in
     )
 
     # ------------------ Specs (in) --------------------
